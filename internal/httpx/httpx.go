@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -32,6 +33,19 @@ import (
 // trace for a request it just made would otherwise have to search by time and
 // guess, and the end-to-end test would have no deterministic trace to assert on.
 const TraceIDHeader = "X-Trace-Id"
+
+// SamplingPriorityHeader asks the collector's tail sampler to keep this
+// request's trace whatever else it decides.
+//
+// It exists because tail sampling makes a fast, successful trace a 20% lottery
+// (see deploy/collector/config.yaml): "run this one request and watch it" is
+// otherwise impossible, and scripts/verify-stack.sh could not assert on a
+// specific trace at all. Send `X-Sampling-Priority: high`.
+const SamplingPriorityHeader = "X-Sampling-Priority"
+
+// AttrSamplingPriorityHigh is the span attribute the collector's
+// `explicitly-requested` tail-sampling policy matches on.
+const AttrSamplingPriorityHigh = "sampling.priority.high"
 
 // MaxBodyBytes bounds a request body. Without it a malformed client can make a
 // service allocate without limit, and the resulting OOM looks like a tracing
@@ -124,13 +138,22 @@ func routeTag(name string, next http.Handler) http.Handler {
 	})
 }
 
-// traceIDHeader publishes the server span's trace id on the response. It runs
-// inside otelhttp's handler so that there is a span to read, and writes the
-// header before the application handler can call WriteHeader.
+// traceIDHeader publishes the server span's trace id on the response, and
+// honours an explicit sampling request. It runs inside otelhttp's handler so
+// that there is a span to read, and writes the header before the application
+// handler can call WriteHeader.
+//
+// The sampling attribute goes on the server span of whichever service received
+// the header -- normally the gateway. A tail-sampling policy matches a trace if
+// *any* of its spans match, so one span is enough to keep the whole trace.
 func traceIDHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
+		span := trace.SpanFromContext(r.Context())
+		if sc := span.SpanContext(); sc.IsValid() {
 			w.Header().Set(TraceIDHeader, sc.TraceID().String())
+		}
+		if strings.EqualFold(r.Header.Get(SamplingPriorityHeader), "high") {
+			span.SetAttributes(attribute.Bool(AttrSamplingPriorityHigh, true))
 		}
 		next.ServeHTTP(w, r)
 	})

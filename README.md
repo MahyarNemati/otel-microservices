@@ -167,7 +167,7 @@ produces every trace shape:
 | `SKU-COCOA` | 202 then 409 | only 8 in stock, so it runs out |
 | `OOS-MATCHA` | 409 | **client** fault: exception recorded, span status left **Unset** |
 | `ERR-BROKEN` | 500 | a panic inside `inventory.reserve`, recovered **in the span that failed**, with a stack trace |
-| `FAIL-CRATE` | 202, then fails | fails in the **Node worker**, on the far side of the queue — the error span is a child of the Go publish span, seconds later |
+| `FAIL-CRATE` | 202, then fails | fails in the **Node worker**, on the far side of the queue — the error span is a child of the Go publish span, seconds later. Inventory stocks it deliberately: a 404 here and the job would never reach the worker |
 | `SKU-NOPE` | 404 | unknown SKU |
 
 ---
@@ -320,11 +320,33 @@ id for `decision_wait` and then judges the finished trace. The policies in
 | `errors` | every trace containing a span with status `ERROR` |
 | `slow` | every trace over 500ms, successful or not |
 | `chaos-marked` | every trace the chaos script touched, so a demo is always visible |
-| `explicitly-requested` | anything carrying `sampling.priority.high` |
+| `explicitly-requested` | anything carrying `sampling.priority.high` — see [below](#asking-for-one-trace-to-be-kept) |
 | `baseline` | 20% of ordinary, fast, successful traffic |
 
 So the services sample **everything** at the head
 (`OTEL_TRACES_SAMPLER_ARG=1.0`) and let the collector decide.
+
+#### Asking for one trace to be kept
+
+The flip side of `baseline` at 20% is that "run this request and watch it" is a
+lottery: four times in five the trace you wanted is gone. So every service
+honours a header:
+
+```bash
+curl -X POST localhost:8080/checkout \
+  -H 'X-Sampling-Priority: high' \
+  -H 'Content-Type: application/json' \
+  -d '{"sku":"SKU-TEA","quantity":2}'
+```
+
+which sets `sampling.priority.high=true` on that service's server span and so
+matches the `explicitly-requested` policy. A tail-sampling policy keeps a trace
+if **any** of its spans match, so one span is enough.
+
+This is not a convenience bolted on afterwards: without it `verify-stack.sh`
+could not assert on a specific trace at all, and would fail 80% of the time
+while reporting entirely correct behaviour. Finding that out is the clearest
+demonstration of what tail sampling actually does.
 
 The costs are real and worth stating:
 
@@ -403,7 +425,7 @@ describe the same thing.
 Docker is not required for any of it.
 
 ```bash
-go test ./...                              # 50 tests
+go test ./...                              # 55 tests
 cd services/fulfillment && npm test        # 30 tests
 ```
 
@@ -471,7 +493,14 @@ backends as one correlated whole. Every assertion is on content:
 
 - Tempo returns a trace with ≥10 spans, containing all four `service.name`s and
   nine named spans — polling for "at least N spans", because Tempo answers 200
-  with a partial trace while the ingester is still receiving.
+  with a partial trace while the ingester is still receiving. The trace envelope
+  differs between Tempo's v1 and v2 trace APIs (`batches` vs
+  `trace.resourceSpans`), so the script normalises both: hard-coding one shape
+  makes a working stack report zero spans, which is indistinguishable from real
+  data loss.
+- Every request it makes carries `X-Sampling-Priority: high`, and it asserts the
+  attribute landed — so a pass means the tail sampler kept the trace on purpose
+  rather than by 20% luck.
 - The Node consumer span's `parentSpanId` **equals** the Go publish span's id.
 - Loki returns log lines from both `orders` and `fulfillment` filtered by
   `| trace_id="<the id we were handed>"`.
@@ -504,6 +533,12 @@ Standard OTel variables where they exist, read in one place per runtime
 | `ORDERS_URL`, `INVENTORY_URL` | compose DNS names | |
 | `REDIS_ADDR` / `REDIS_URL` | `redis:6379` | Go / Node |
 | `QUEUE_PREFIX`, `QUEUE_TOPIC` | `otelq`, `orders.fulfil` | |
+
+One request header, honoured by every service:
+
+| Header | | |
+|---|---|---|
+| `X-Sampling-Priority: high` | — | sets `sampling.priority.high` so the collector keeps this trace whatever else it decides |
 
 Chaos dials, read by the three Go services
 ([`internal/chaos`](internal/chaos/chaos.go)). They accept either `25` or

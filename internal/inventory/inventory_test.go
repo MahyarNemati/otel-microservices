@@ -248,3 +248,32 @@ func TestHandlerErrorResponseCarriesTraceID(t *testing.T) {
 		t.Errorf("server span status = %v, want Error", server.Status.Code)
 	}
 }
+
+// TestWorkerFailureSKUIsReservable guards the far-side-of-the-queue error path.
+// Inventory must stock FAIL-, or checkout 404s here and the job never reaches
+// the Node worker -- so the interesting failure, an error span parented on a
+// publish span in another process, would never be produced at all.
+func TestWorkerFailureSKUIsReservable(t *testing.T) {
+	t.Parallel()
+	rec := obstest.New(t, obstest.Options{})
+	store := inventory.NewStore(rec.Tracer)
+
+	if _, ok := store.Level(inventory.PrefixWorkerFailure + "CRATE"); !ok {
+		t.Fatalf("%sCRATE is not in the catalogue", inventory.PrefixWorkerFailure)
+	}
+
+	ctx, root := rec.Tracer.Start(context.Background(), "caller")
+	remaining, err := store.Reserve(ctx, inventory.PrefixWorkerFailure+"CRATE", 1)
+	root.End()
+	if err != nil {
+		t.Fatalf("Reserve: %v; the worker-failure path is unreachable", err)
+	}
+	if remaining < 1 {
+		t.Errorf("remaining = %d; stock it generously so a long CI run does not exhaust it", remaining)
+	}
+
+	span := rec.Span(t, "inventory.reserve")
+	if span.Status.Code != codes.Unset {
+		t.Errorf("span status = %v, want Unset: inventory succeeds, the worker is what fails", span.Status.Code)
+	}
+}

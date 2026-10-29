@@ -37,6 +37,12 @@ const (
 	PrefixOutOfStock = "OOS-"
 	// PrefixPanic makes the reservation panic, exercising the recovery path.
 	PrefixPanic = "ERR-"
+	// PrefixWorkerFailure reserves normally and then fails in the Node worker,
+	// on the far side of the queue. Inventory has to stock it: a checkout that
+	// 404s here never reaches the worker at all, so the interesting failure --
+	// an error span parented on a publish span in another process -- would
+	// never happen.
+	PrefixWorkerFailure = "FAIL-"
 )
 
 // Store holds stock levels. In-memory on purpose: a real database would add a
@@ -53,11 +59,12 @@ func NewStore(tracer trace.Tracer) *Store {
 	return &Store{
 		tracer: tracer,
 		levels: map[string]int{
-			"SKU-TEA":                   120,
-			"SKU-COFFEE":                40,
-			"SKU-COCOA":                 8,
-			PrefixOutOfStock + "MATCHA": 0,
-			PrefixPanic + "BROKEN":      5,
+			"SKU-TEA":                     120,
+			"SKU-COFFEE":                  40,
+			"SKU-COCOA":                   8,
+			PrefixOutOfStock + "MATCHA":   0,
+			PrefixPanic + "BROKEN":        5,
+			PrefixWorkerFailure + "CRATE": 500,
 		},
 	}
 }

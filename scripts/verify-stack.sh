@@ -70,10 +70,16 @@ wait_for 'fulfillment worker' "${FULFILLMENT:-http://localhost:8083}/healthz" ||
 # ---------------------------------------------------------------------------
 step '2. Driving one successful checkout'
 # ---------------------------------------------------------------------------
+# X-Sampling-Priority: high is not optional here. The collector's tail sampler
+# keeps only 20% of fast, successful traces, so asserting on *this* trace
+# without it is an 80% chance of a red build that is reporting correct
+# behaviour. The header sets sampling.priority.high on the gateway's server
+# span, which the `explicitly-requested` policy matches.
 checkout() {
   local sku="$1" qty="${2:-1}"
   curl -sS -X POST "$GATEWAY/checkout" \
     -H 'Content-Type: application/json' \
+    -H 'X-Sampling-Priority: high' \
     -D /tmp/verify-headers -o /tmp/verify-body -w '%{http_code}' \
     -d "{\"sku\":\"$sku\",\"quantity\":$qty,\"customer\":\"verify\"}"
 }
@@ -125,11 +131,31 @@ fi
 step '3. The trace arrives in Tempo, connected, with every service in it'
 # ---------------------------------------------------------------------------
 
-# Tempo serves OTLP JSON when asked for it. The protobuf default is unhelpful
-# in a shell script.
+# Tempo serves OTLP JSON when asked for it; the protobuf default is unhelpful in
+# a shell script.
+#
+# The envelope has changed across Tempo versions -- v1 returns {"batches": [...]},
+# v2 returns {"trace": {"resourceSpans": [...]}} -- so the fetch tries v2 first
+# and falls back, and JQ_GROUPS below normalises whichever arrives. Hard-coding one
+# shape means a working stack reports zero spans, which is indistinguishable
+# from real data loss.
+JQ_GROUPS='def groups: (.trace.resourceSpans // .resourceSpans // .batches // []); groups[]'
+
 fetch_trace() {
-  curl -sS -H 'Accept: application/json' --max-time 10 "$TEMPO/api/traces/$1" 2>/dev/null || true
+  local id="$1" body
+  for path in "api/v2/traces" "api/traces"; do
+    body="$(curl -sS -H 'Accept: application/json' --max-time 10 "$TEMPO/$path/$id" 2>/dev/null || true)"
+    if [[ -n "$body" ]] && printf '%s' "$body" | jq -e "[${JQ_GROUPS}] | length > 0" >/dev/null 2>&1; then
+      printf '%s' "$body"
+      return 0
+    fi
+  done
+  printf '%s' "${body:-}"
 }
+
+# The `groups[]` iteration is baked into JQ_GROUPS rather than appended at each
+# use site, so no expansion is ever followed by a `[` -- which both the shell
+# and shellcheck would read as an array subscript.
 
 # Poll until the trace has at least the expected number of spans. Polling for
 # "the endpoint returned 200" is not enough: Tempo answers with an empty or
@@ -140,8 +166,8 @@ poll_trace() {
   while ((SECONDS < deadline)); do
     local json
     json="$(fetch_trace "$id")"
-    if [[ -n "$json" ]] && printf '%s' "$json" | jq -e '.batches' >/dev/null 2>&1; then
-      spans="$(printf '%s' "$json" | jq '[.batches[].scopeSpans[].spans[]] | length')"
+    if [[ -n "$json" ]] && printf '%s' "$json" | jq -e "[${JQ_GROUPS}] | length > 0" >/dev/null 2>&1; then
+      spans="$(printf '%s' "$json" | jq "[${JQ_GROUPS} | .scopeSpans[]? | .spans[]?] | length")"
       if ((spans >= want_spans)); then
         printf '%s' "$json" > /tmp/verify-trace.json
         return 0
@@ -172,13 +198,13 @@ else
   exit 1
 fi
 
-span_count="$(jq '[.batches[].scopeSpans[].spans[]] | length' < /tmp/verify-trace.json)"
+span_count="$(jq "[${JQ_GROUPS} | .scopeSpans[]? | .spans[]?] | length" < /tmp/verify-trace.json)"
 info "$span_count spans in the trace"
 
-services="$(jq -r '
-  [.batches[].resource.attributes[]
-   | select(.key == "service.name") | .value.stringValue] | sort | unique | .[]
-' < /tmp/verify-trace.json)"
+services="$(jq -r "
+  [${JQ_GROUPS} | .resource.attributes[]?
+   | select(.key == \"service.name\") | .value.stringValue] | sort | unique | .[]
+" < /tmp/verify-trace.json)"
 
 for want in gateway orders inventory fulfillment; do
   if printf '%s\n' "$services" | grep -qx "$want"; then
@@ -188,7 +214,7 @@ for want in gateway orders inventory fulfillment; do
   fi
 done
 
-span_names="$(jq -r '.batches[].scopeSpans[].spans[].name' < /tmp/verify-trace.json | sort)"
+span_names="$(jq -r "${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | .name" < /tmp/verify-trace.json | sort)"
 for want in \
   'POST /checkout' \
   'POST /orders' \
@@ -212,12 +238,12 @@ done
 # because the worker's spans would be in a different trace entirely and the
 # per-service check above would already have failed -- but this pins the exact
 # parent link rather than mere co-location.
-publish_span_id="$(jq -r '
-  [.batches[].scopeSpans[].spans[] | select(.name == "orders.fulfil publish")][0].spanId // ""
-' < /tmp/verify-trace.json)"
-process_parent_id="$(jq -r '
-  [.batches[].scopeSpans[].spans[] | select(.name == "orders.fulfil process")][0].parentSpanId // ""
-' < /tmp/verify-trace.json)"
+publish_span_id="$(jq -r "
+  [${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | select(.name == \"orders.fulfil publish\")][0].spanId // \"\"
+" < /tmp/verify-trace.json)"
+process_parent_id="$(jq -r "
+  [${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | select(.name == \"orders.fulfil process\")][0].parentSpanId // \"\"
+" < /tmp/verify-trace.json)"
 
 if [[ -n "$publish_span_id" && "$publish_span_id" == "$process_parent_id" ]]; then
   pass "the Node consumer span's parent is the Go publish span ($publish_span_id)"
@@ -225,12 +251,24 @@ else
   fail "consumer parent '$process_parent_id' is not the publish span '$publish_span_id': the queue hop lost the parent"
 fi
 
+# The sampling request must be visible on the span, or the trace above was kept
+# by luck rather than by the policy -- and the next run would be a coin flip.
+priority="$(jq -r "
+  [${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | .attributes[]?
+   | select(.key == \"sampling.priority.high\") | .value.boolValue] | .[0] // empty
+" < /tmp/verify-trace.json)"
+if [[ "$priority" == "true" ]]; then
+  pass 'sampling.priority.high=true is on the trace, so the tail sampler kept it deliberately'
+else
+  fail "sampling.priority.high is not set on the trace (got '${priority:-<absent>}'); this trace survived 20% probability by luck"
+fi
+
 # Resource attributes the dashboards group by.
 for attr in service.version deployment.environment.name; do
-  count="$(jq --arg k "$attr" '
-    [.batches[].resource.attributes[] | select(.key == $k)] | length
-  ' < /tmp/verify-trace.json)"
-  batches="$(jq '.batches | length' < /tmp/verify-trace.json)"
+  count="$(jq --arg k "$attr" "
+    [${JQ_GROUPS} | .resource.attributes[]? | select(.key == \$k)] | length
+  " < /tmp/verify-trace.json)"
+  batches="$(jq "[${JQ_GROUPS}] | length" < /tmp/verify-trace.json)"
   if ((count >= batches)); then
     pass "every resource in the trace carries $attr"
   else
@@ -244,19 +282,19 @@ step '4. The error trace records an exception, not just a string'
 if poll_trace "$inv_fail_trace" 5; then
   pass "Tempo returned the failing trace $inv_fail_trace"
 
-  error_spans="$(jq '[.batches[].scopeSpans[].spans[] | select(.status.code == 2)] | length' < /tmp/verify-trace.json)"
+  error_spans="$(jq "[${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | select(.status.code == 2)] | length" < /tmp/verify-trace.json)"
   if ((error_spans > 0)); then
     pass "$error_spans span(s) carry status=ERROR, so Tempo's error filter and the tail sampler see it"
   else
     fail 'no span in the failing trace has status=ERROR'
   fi
 
-  exception_stacks="$(jq '
-    [.batches[].scopeSpans[].spans[].events // [] | .[]
-     | select(.name == "exception")
-     | .attributes[] | select(.key == "exception.stacktrace")
+  exception_stacks="$(jq "
+    [${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | (.events // [])[]
+     | select(.name == \"exception\")
+     | .attributes[]? | select(.key == \"exception.stacktrace\")
      | select(.value.stringValue | length > 0)] | length
-  ' < /tmp/verify-trace.json)"
+  " < /tmp/verify-trace.json)"
   if ((exception_stacks > 0)); then
     pass 'an exception event carries a non-empty exception.stacktrace'
   else
@@ -268,11 +306,11 @@ fi
 
 # The worker-side failure: the error is on the far side of the queue.
 if poll_trace "$worker_fail_trace" 8; then
-  worker_error="$(jq '
-    [.batches[] as $b
-     | $b.resource.attributes[] | select(.key == "service.name" and .value.stringValue == "fulfillment")
-     | $b.scopeSpans[].spans[] | select(.status.code == 2)] | length
-  ' < /tmp/verify-trace.json)"
+  worker_error="$(jq "
+    [${JQ_GROUPS} as \$g
+     | \$g.resource.attributes[]? | select(.key == \"service.name\" and .value.stringValue == \"fulfillment\")
+     | \$g.scopeSpans[]? | .spans[]? | select(.status.code == 2)] | length
+  " < /tmp/verify-trace.json)"
   if ((worker_error > 0)); then
     pass 'the Node worker recorded its failure as an ERROR span inside the gateway trace'
   else
@@ -380,7 +418,7 @@ if poll_exemplars; then
 
   resolvable=0
   for candidate in $(jq -r '[.data[].exemplars[].labels.trace_id] | unique | .[0:10][]' < /tmp/verify-exemplars.json); do
-    if fetch_trace "$candidate" | jq -e '.batches | length > 0' >/dev/null 2>&1; then
+    if fetch_trace "$candidate" | jq -e "[${JQ_GROUPS}] | length > 0" >/dev/null 2>&1; then
       resolvable=1
       pass "exemplar $candidate resolves to a trace in Tempo"
       break
@@ -395,13 +433,27 @@ else
 fi
 
 # The collector's spanmetrics series, which is the only metrics path the Node
-# worker has.
-spanmetrics="$(curl -sS --max-time 10 -G "$PROMETHEUS/api/v1/query" \
-  --data-urlencode 'query=count by (service_name) (traces_span_metrics_calls_total)' 2>/dev/null || true)"
-worker_series="$(printf '%s' "$spanmetrics" | jq -r '
-  [.data.result[]? | select(.metric.service_name == "fulfillment")] | length
-' 2>/dev/null || echo 0)"
-if [[ "$worker_series" =~ ^[0-9]+$ ]] && ((worker_series > 0)); then
+# worker has. Polled, because the connector flushes on its own 15s interval and
+# Prometheus then has to scrape it.
+spanmetrics=''
+poll_spanmetrics() {
+  local deadline=$((SECONDS + EXEMPLAR_TIMEOUT))
+  while ((SECONDS < deadline)); do
+    spanmetrics="$(curl -sS --max-time 10 -G "$PROMETHEUS/api/v1/query" \
+      --data-urlencode 'query=count by (service_name) (traces_span_metrics_calls_total)' 2>/dev/null || true)"
+    local n
+    n="$(printf '%s' "$spanmetrics" | jq -r '
+      [.data.result[]? | select(.metric.service_name == "fulfillment")] | length
+    ' 2>/dev/null || echo 0)"
+    if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 0)); then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+if poll_spanmetrics; then
   pass 'the collector derived spanmetrics for the Node worker'
 else
   fail 'no traces_span_metrics_calls_total series for service_name=fulfillment'
