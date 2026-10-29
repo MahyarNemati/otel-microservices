@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -82,6 +83,16 @@ type ServerOptions struct {
 	// application traces.
 	Plain map[string]http.Handler
 
+	// Logger, when non-nil, writes one line per request from inside the server
+	// span, so every served request leaves a trace-correlated log line.
+	//
+	// Without it the correlation machinery is real but has nothing to carry: a
+	// service that only logs at start-up produces no lines inside any span, and
+	// "click a span, see its logs" shows an empty panel. That is how this was
+	// first discovered here -- the Node worker's lines were correlated because
+	// it logs per job, and the Go services' were absent because they did not.
+	Logger *slog.Logger
+
 	// TracerProvider and Propagators override the globals. Production passes
 	// neither and gets what obs.Setup installed; tests pass an in-memory
 	// provider, which is what makes the span assertions possible without
@@ -98,6 +109,9 @@ func NewServerHandler(opts ServerOptions) http.Handler {
 		handler := http.Handler(r.Handler)
 		if opts.Metrics != nil {
 			handler = observe(opts.Metrics, r.Name, handler)
+		}
+		if opts.Logger != nil {
+			handler = accessLog(opts.Logger, r.Name, handler)
 		}
 		handler = traceIDHeader(handler)
 		app.Handle(r.Pattern, routeTag(r.Name, handler))
@@ -186,6 +200,35 @@ func (s *statusRecorder) Status() int {
 		return http.StatusOK
 	}
 	return s.status
+}
+
+// accessLog writes one line per served request. It runs inside otelhttp's
+// handler, so the request context carries the server span and obs.TraceHandler
+// stamps trace_id/span_id onto the line.
+//
+// The route *template* is logged, never the raw target: a Loki label or a log
+// field holding order ids is the same cardinality mistake as a span name
+// holding them.
+func accessLog(logger *slog.Logger, route string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+
+		level := slog.LevelInfo
+		switch {
+		case rec.Status() >= 500:
+			level = slog.LevelError
+		case rec.Status() >= 400:
+			level = slog.LevelWarn
+		}
+		logger.Log(r.Context(), level, "request served",
+			slog.String("http.route", route),
+			slog.String("http.request.method", r.Method),
+			slog.Int("http.response.status_code", rec.Status()),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+		)
+	})
 }
 
 func observe(reg *metrics.Registry, route string, next http.Handler) http.Handler {

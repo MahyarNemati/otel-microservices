@@ -256,6 +256,16 @@ One `slog` call reaches two sinks — the container's stdout and the OTLP log
 pipeline — via a fanout handler, so the call site does not know there are two
 destinations.
 
+**And something has to actually log inside a span.** This sounds too obvious to
+say, but it is how the first end-to-end run failed: the correlation machinery
+was correct and the Loki query returned nothing, because the Go services logged
+only at start-up and so produced no line inside any request span. "Click a span,
+see its logs" showed an empty panel. `internal/httpx` now emits one access-log
+line per request from inside the server span, and `orders` logs the order and
+the queue message id — the fields a reader wants beside the waterfall. The route
+*template* is logged, never the target: ids in a log field are the same
+cardinality mistake as ids in a span name.
+
 In Loki, the ids live in **structured metadata**, not labels. A trace id as a
 label would mean one Loki stream per trace. That is why
 [`loki.yaml`](deploy/loki/loki.yaml) sets `allow_structured_metadata: true` and
@@ -425,7 +435,7 @@ describe the same thing.
 Docker is not required for any of it.
 
 ```bash
-go test ./...                              # 55 tests
+go test ./...                              # 57 tests
 cd services/fulfillment && npm test        # 30 tests
 ```
 
@@ -503,7 +513,8 @@ backends as one correlated whole. Every assertion is on content:
   rather than by 20% luck.
 - The Node consumer span's `parentSpanId` **equals** the Go publish span's id.
 - Loki returns log lines from both `orders` and `fulfillment` filtered by
-  `| trace_id="<the id we were handed>"`.
+  `| trace_id="<the id we were handed>"` — both runtimes, because a correlation
+  implemented in only one of them is the usual state of affairs.
 - A Prometheus exemplar exists **and the trace it names resolves in Tempo**.
 - `traces_span_metrics_calls_total` has a series for `fulfillment`, which has
   no `/metrics` endpoint of its own.
@@ -599,12 +610,21 @@ error traces all arrive.
 - **Grafana runs with anonymous admin.** Fine for a demo on `localhost`,
   obviously not otherwise.
 
-**Known trap, written down because it cost time:** `resource.Merge` returns
-*conflicting Schema URL* when the imported `semconv` version does not match the
-one `resource.Default()` was built with, and a service whose resource failed to
-build starts with no resource at all — so every dashboard grouping silently
-collapses. Keep the `semconv/vX.Y.Z` import in step with the OTel SDK version
-in `go.mod`.
+**Three traps, written down because each one cost time here:**
+
+1. Tempo's trace API returns a different JSON envelope in v1 and v2
+   (`{"batches": …}` vs `{"trace": {"resourceSpans": …}}`), and protojson
+   renders the span status enum by **name** — `"STATUS_CODE_ERROR"`, not `2`.
+   Either mistake makes a perfectly healthy stack report zero spans or zero
+   errors, which is indistinguishable from data loss.
+2. Correlation needs something to correlate. See
+   [above](#2-trace-and-log-correlation).
+3. `resource.Merge` returns
+   *conflicting Schema URL* when the imported `semconv` version does not match
+   the one `resource.Default()` was built with, and a service whose resource
+   failed to build starts with no resource at all — so every dashboard grouping
+   silently collapses. Keep the `semconv/vX.Y.Z` import in step with the OTel
+   SDK version in `go.mod`.
 
 ---
 

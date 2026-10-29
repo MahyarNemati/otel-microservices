@@ -139,7 +139,13 @@ step '3. The trace arrives in Tempo, connected, with every service in it'
 # and falls back, and JQ_GROUPS below normalises whichever arrives. Hard-coding one
 # shape means a working stack reports zero spans, which is indistinguishable
 # from real data loss.
-JQ_GROUPS='def groups: (.trace.resourceSpans // .resourceSpans // .batches // []); groups[]'
+# iserror exists because protojson renders an enum by NAME rather than by
+# number: an Error span comes back as {"status":{"code":"STATUS_CODE_ERROR"}},
+# so `.status.code == 2` silently matches nothing and the check reports "no
+# error spans" for a trace full of them. Accept both forms.
+JQ_GROUPS='def groups: (.trace.resourceSpans // .resourceSpans // .batches // []);
+def iserror: (.status.code // 0) | (. == 2 or . == "STATUS_CODE_ERROR");
+groups[]'
 
 fetch_trace() {
   local id="$1" body
@@ -282,7 +288,7 @@ step '4. The error trace records an exception, not just a string'
 if poll_trace "$inv_fail_trace" 5; then
   pass "Tempo returned the failing trace $inv_fail_trace"
 
-  error_spans="$(jq "[${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | select(.status.code == 2)] | length" < /tmp/verify-trace.json)"
+  error_spans="$(jq "[${JQ_GROUPS} | .scopeSpans[]? | .spans[]? | select(iserror)] | length" < /tmp/verify-trace.json)"
   if ((error_spans > 0)); then
     pass "$error_spans span(s) carry status=ERROR, so Tempo's error filter and the tail sampler see it"
   else
@@ -309,7 +315,7 @@ if poll_trace "$worker_fail_trace" 8; then
   worker_error="$(jq "
     [${JQ_GROUPS} as \$g
      | \$g.resource.attributes[]? | select(.key == \"service.name\" and .value.stringValue == \"fulfillment\")
-     | \$g.scopeSpans[]? | .spans[]? | select(.status.code == 2)] | length
+     | \$g.scopeSpans[]? | .spans[]? | select(iserror)] | length
   " < /tmp/verify-trace.json)"
   if ((worker_error > 0)); then
     pass 'the Node worker recorded its failure as an ERROR span inside the gateway trace'

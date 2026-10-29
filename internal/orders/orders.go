@@ -11,6 +11,7 @@ package orders
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -119,6 +120,7 @@ type Service struct {
 	chaos     *chaos.Injector
 	tracer    trace.Tracer
 	metrics   *metrics.Registry
+	logger    *slog.Logger
 }
 
 // Publisher is the subset of the queue publisher this service needs, so tests
@@ -127,12 +129,17 @@ type Publisher interface {
 	Publish(ctx context.Context, topic string, body any) (queue.Message, error)
 }
 
-// NewService builds the service.
-func NewService(cfg Config, store *Store, publisher Publisher, client *http.Client, injector *chaos.Injector, tracer trace.Tracer, reg *metrics.Registry) *Service {
+// NewService builds the service. A nil logger discards the business log lines;
+// the access log in internal/httpx is separate.
+func NewService(cfg Config, store *Store, publisher Publisher, client *http.Client, injector *chaos.Injector, tracer trace.Tracer, reg *metrics.Registry, logger *slog.Logger) *Service {
 	if cfg.NewOrderID == nil {
 		cfg.NewOrderID = newOrderID
 	}
+	if logger == nil {
+		logger = slog.New(discardHandler{})
+	}
 	return &Service{
+		logger:    logger,
 		cfg:       cfg,
 		store:     store,
 		publisher: publisher,
@@ -232,6 +239,14 @@ func (s *Service) handleCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.InfoContext(r.Context(), "order accepted for fulfilment",
+		slog.String("order.id", order.ID),
+		slog.String("order.sku", order.SKU),
+		slog.Int("order.quantity", order.Quantity),
+		slog.String("messaging.message.id", msg.ID),
+		slog.Int("inventory.remaining", reserved.Remaining),
+	)
+
 	traceID := trace.SpanContextFromContext(r.Context()).TraceID().String()
 	httpx.WriteJSON(w, http.StatusAccepted, CheckoutResponse{
 		OrderID:   order.ID,
@@ -259,3 +274,12 @@ func (s *Service) handleGet(w http.ResponseWriter, r *http.Request) {
 func newOrderID() string {
 	return fmt.Sprintf("ord-%d", time.Now().UnixNano())
 }
+
+// discardHandler is a slog.Handler that drops everything, so a nil logger needs
+// no nil check at each call site.
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false }
+func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
+func (discardHandler) WithAttrs([]slog.Attr) slog.Handler        { return discardHandler{} }
+func (discardHandler) WithGroup(string) slog.Handler             { return discardHandler{} }

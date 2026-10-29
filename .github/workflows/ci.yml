@@ -79,8 +79,8 @@ jobs:
             > /tmp/go-test.log 2>&1 || { cat /tmp/go-test.log; exit 1; }
           passed="$(grep -c '^--- PASS' /tmp/go-test.log || true)"
           echo "$passed Go tests passed"
-          if [ "$passed" -lt 50 ]; then
-            echo "expected at least 50 passing Go tests, got $passed"
+          if [ "$passed" -lt 55 ]; then
+            echo "expected at least 55 passing Go tests, got $passed"
             cat /tmp/go-test.log
             exit 1
           fi
@@ -90,7 +90,8 @@ jobs:
                       TestResourceAttributesReachExportedSpans \
                       TestUnsampledParentIsNotResampled \
                       TestSamplingPriorityHeaderSetsSpanAttribute \
-                      TestWorkerFailureSKUIsReservable; do
+                      TestWorkerFailureSKUIsReservable \
+                      TestCheckoutLogsAreCorrelatedWithTheTrace; do
             grep -q -- "--- PASS: $want" /tmp/go-test.log || {
               echo "$want did not run or did not pass"
               exit 1

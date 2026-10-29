@@ -1,8 +1,10 @@
 package orders_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,11 +32,13 @@ type stack struct {
 	queue     *queue.Memory
 	publisher *queue.Publisher
 	consumer  *queue.Consumer
+	logs      *bytes.Buffer
 }
 
 func newStack(t *testing.T, injector *chaos.Injector) *stack {
 	t.Helper()
 	rec := obstest.New(t, obstest.Options{})
+	logs := &bytes.Buffer{}
 
 	invSvc := inventory.NewService(inventory.NewStore(rec.Tracer), chaos.New(chaos.Config{}), rec.Tracer)
 	invSrv := httptest.NewServer(httpx.NewServerHandler(httpx.ServerOptions{
@@ -64,10 +68,12 @@ func newStack(t *testing.T, injector *chaos.Injector) *stack {
 		injector,
 		rec.Tracer,
 		metrics.New(obs.Config{ServiceName: "orders", ServiceVersion: "test", Environment: "test"}),
+		slog.New(obs.NewTraceHandler(slog.NewJSONHandler(logs, nil))),
 	)
 	ordSrv := httptest.NewServer(httpx.NewServerHandler(httpx.ServerOptions{
 		ServiceName:    "orders",
 		Routes:         ordSvc.Routes(),
+		Logger:         slog.New(obs.NewTraceHandler(slog.NewJSONHandler(logs, nil))),
 		TracerProvider: rec.Provider(),
 		Propagators:    rec.Propagator,
 	}))
@@ -75,6 +81,7 @@ func newStack(t *testing.T, injector *chaos.Injector) *stack {
 
 	return &stack{
 		rec:       rec,
+		logs:      logs,
 		orders:    ordSrv,
 		queue:     q,
 		publisher: publisher,
@@ -380,4 +387,129 @@ func TestGetUnknownOrderIsNotFound(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
+}
+
+// TestCheckoutLogsAreCorrelatedWithTheTrace is the assertion that was missing
+// when the end-to-end check first ran: the correlation machinery was correct
+// but the Go services logged nothing inside a request span, so Loki held no
+// line to find and "click a span, see its logs" showed an empty panel.
+//
+// It asserts on the lines the service actually wrote, their trace ids, and the
+// business fields a reader needs beside the waterfall.
+func TestCheckoutLogsAreCorrelatedWithTheTrace(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, chaos.New(chaos.Config{}))
+
+	resp := st.checkout(t, `{"sku":"SKU-TEA","quantity":2,"customer":"ada"}`)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	traceID := st.rec.Span(t, "POST /orders").SpanContext.TraceID().String()
+	spanID := st.rec.Span(t, "POST /orders").SpanContext.SpanID().String()
+
+	lines := []map[string]any{}
+	for _, raw := range strings.Split(strings.TrimSpace(st.logs.String()), "\n") {
+		if raw == "" {
+			continue
+		}
+		var line map[string]any
+		if err := json.Unmarshal([]byte(raw), &line); err != nil {
+			t.Fatalf("log line is not JSON (%q): %v", raw, err)
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) < 2 {
+		t.Fatalf("the request produced %d log lines, want at least 2 (business + access):\n%s", len(lines), st.logs.String())
+	}
+
+	byMsg := map[string]map[string]any{}
+	for _, line := range lines {
+		msg, _ := line["msg"].(string)
+		byMsg[msg] = line
+		// Every line written during the request must be correlated, not just
+		// the one we happen to assert on below.
+		if got := line[obs.LogKeyTraceID]; got != traceID {
+			t.Errorf("line %q has trace_id %v, want %s", msg, got, traceID)
+		}
+		if got := line[obs.LogKeySpanID]; got != spanID {
+			t.Errorf("line %q has span_id %v, want the server span %s", msg, got, spanID)
+		}
+	}
+
+	business, ok := byMsg["order accepted for fulfilment"]
+	if !ok {
+		t.Fatalf("no business log line; got %v", keysOf(byMsg))
+	}
+	if business["order.id"] != "ord-test" {
+		t.Errorf("business line order.id = %v, want ord-test", business["order.id"])
+	}
+	if business["messaging.message.id"] == nil || business["messaging.message.id"] == "" {
+		t.Error("business line carries no messaging.message.id, so the log cannot be joined to the queue hop")
+	}
+
+	access, ok := byMsg["request served"]
+	if !ok {
+		t.Fatalf("no access log line; got %v", keysOf(byMsg))
+	}
+	// The route template, not the target: ids in a log field are the same
+	// cardinality mistake as ids in a span name.
+	if access["http.route"] != "POST /orders" {
+		t.Errorf("access line http.route = %v, want the route template", access["http.route"])
+	}
+	if got := access["http.response.status_code"]; got != float64(202) {
+		t.Errorf("access line status = %v, want 202", got)
+	}
+}
+
+// TestFailedCheckoutLogsAtErrorLevel keeps the access log useful for the
+// "recent errors" panel, which filters on level.
+func TestFailedCheckoutLogsAtErrorLevel(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, chaos.New(chaos.Config{}))
+
+	if resp := st.checkout(t, `{"sku":"`+inventory.PrefixPanic+`BROKEN","quantity":1}`); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+
+	var access map[string]any
+	for _, raw := range strings.Split(strings.TrimSpace(st.logs.String()), "\n") {
+		var line map[string]any
+		if err := json.Unmarshal([]byte(raw), &line); err == nil && line["msg"] == "request served" {
+			access = line
+		}
+	}
+	if access == nil {
+		t.Fatalf("no access log line:\n%s", st.logs.String())
+	}
+	if access["level"] != "ERROR" {
+		t.Errorf("level = %v, want ERROR for a 500", access["level"])
+	}
+	if access[obs.LogKeyTraceID] != st.rec.Span(t, "POST /orders").SpanContext.TraceID().String() {
+		t.Error("the error line is not correlated with the failing trace")
+	}
+
+	// A 4xx must not be logged as an error, for the same reason its span status
+	// stays Unset.
+	st.logs.Reset()
+	st.rec.Reset()
+	if resp := st.checkout(t, `{"sku":"`+inventory.PrefixOutOfStock+`MATCHA","quantity":1}`); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	for _, raw := range strings.Split(strings.TrimSpace(st.logs.String()), "\n") {
+		var line map[string]any
+		if err := json.Unmarshal([]byte(raw), &line); err == nil && line["msg"] == "request served" {
+			if line["level"] != "WARN" {
+				t.Errorf("level = %v for a 409, want WARN", line["level"])
+			}
+		}
+	}
+}
+
+func keysOf(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

@@ -111,6 +111,10 @@ func (r *Runtime) Serve(opts ServeOptions) error {
 		Metrics:     r.Metrics,
 		Routes:      opts.Routes,
 		Plain:       plain,
+		// Every served request gets a trace-correlated line. /healthz and
+		// /metrics are in Plain, outside this middleware, so a probe every two
+		// seconds does not drown Loki any more than it drowns Tempo.
+		Logger: r.Logger,
 	})
 
 	srv := &http.Server{

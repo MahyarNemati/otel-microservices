@@ -45,6 +45,7 @@ func main() {
 		rt.Chaos,
 		rt.Providers.Tracer,
 		rt.Metrics,
+		rt.Logger,
 	)
 
 	if err := rt.Serve(service.ServeOptions{
