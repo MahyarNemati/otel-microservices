@@ -1,0 +1,264 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# CGO_ENABLED is deliberately NOT set at the workflow level. `go test -race`
+# requires cgo, and a global CGO_ENABLED=0 makes every race job fail instantly
+# with "-race requires cgo". The Dockerfile sets it per-build for static
+# binaries, which is the only place it belongs.
+
+jobs:
+  go:
+    name: go build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l . )"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - run: go build ./...
+
+      # The entrypoints must exist as main packages. `go build ./...` passes
+      # happily when cmd/ has been swallowed by an unanchored .gitignore entry,
+      # because with no main package there is nothing to complain about -- this
+      # has shipped two repositories with no binary before.
+      - name: every cmd/ directory is a main package
+        run: |
+          set -eu
+          expected='gateway inventory orders'
+          found="$(ls cmd | sort | tr '\n' ' ' | sed 's/ $//')"
+          if [ "$found" != "$expected" ]; then
+            echo "cmd/ holds '$found', expected '$expected'"
+            exit 1
+          fi
+          for dir in cmd/*; do
+            name="$(basename "$dir")"
+            pkg="$(go list -f '{{.Name}}' "./$dir")"
+            if [ "$pkg" != "main" ]; then
+              echo "./$dir is package $pkg, not main"
+              exit 1
+            fi
+            go build -o "/tmp/$name" "./$dir"
+            test -x "/tmp/$name" || { echo "./$dir produced no binary"; exit 1; }
+            echo "ok ./$dir -> $name"
+          done
+
+      - name: go test -race
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      # A suite that compiles and runs but exercises nothing goes green. Assert
+      # that the packages carrying the project's claims actually ran tests, and
+      # that the number of them has not collapsed.
+      - name: the tracing suites really ran
+        run: |
+          set -eu
+          go test -count=1 -v ./internal/queue/ ./internal/obs/ ./internal/metrics/ \
+            ./internal/orders/ ./internal/inventory/ ./internal/gateway/ ./internal/chaos/ \
+            > /tmp/go-test.log 2>&1 || { cat /tmp/go-test.log; exit 1; }
+          passed="$(grep -c '^--- PASS' /tmp/go-test.log || true)"
+          echo "$passed Go tests passed"
+          if [ "$passed" -lt 40 ]; then
+            echo "expected at least 40 passing Go tests, got $passed"
+            cat /tmp/go-test.log
+            exit 1
+          fi
+          for want in TestTraceSurvivesAsyncHop TestCheckoutProducesOneConnectedTrace \
+                      TestExemplarCarriesTraceID TestTraceHandlerCorrelatesLogLine \
+                      TestReservePanicIsRecordedAsException \
+                      TestResourceAttributesReachExportedSpans \
+                      TestUnsampledParentIsNotResampled; do
+            grep -q -- "--- PASS: $want" /tmp/go-test.log || {
+              echo "$want did not run or did not pass"
+              exit 1
+            }
+          done
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  node:
+    name: node typecheck and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/fulfillment
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: services/fulfillment/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - name: vitest
+        # shell: bash is required, not cosmetic. The default runner shell is
+        # `bash -e` without pipefail, so `npm test | tee` would mask a failing
+        # suite behind tee's exit status and the job would go green.
+        shell: bash
+        run: npm test -- --reporter=verbose 2>&1 | tee /tmp/vitest.log
+
+      # Same guard as the Go side: prove the suite exercised the worker rather
+      # than merely starting.
+      - name: the propagation suites really ran
+        run: |
+          set -eu
+          passed="$(grep -cE '^\s+(✓|√)' /tmp/vitest.log || true)"
+          echo "$passed Vitest tests passed"
+          if [ "$passed" -lt 25 ]; then
+            echo "expected at least 25 passing Vitest tests, got $passed"
+            cat /tmp/vitest.log
+            exit 1
+          fi
+          for want in 'continues the Go trace and hands it back to Go' \
+                      'parents the consumer span on the Go publish span' \
+                      'correlates every log line it wrote with the Go trace' \
+                      'does not re-sample a parent that was dropped upstream'; do
+            grep -qF "$want" /tmp/vitest.log || {
+              echo "test '$want' did not appear in the run"
+              exit 1
+            }
+          done
+
+  config:
+    name: stack configuration is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: yaml parses, with duplicate keys rejected
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/validate-yaml.py
+
+      - name: shellcheck
+        run: shellcheck -S warning scripts/*.sh
+
+      - name: docker compose config resolves
+        run: docker compose config --quiet
+
+      # The collector will start with a config it cannot honour only if the
+      # config is syntactically wrong; `validate` catches a mistyped processor
+      # name or an exporter that is not in a pipeline, which would otherwise
+      # surface as silently missing telemetry.
+      - name: collector config validates
+        run: |
+          docker run --rm \
+            -v "$PWD/deploy/collector/config.yaml:/etc/otel/config.yaml:ro" \
+            otel/opentelemetry-collector-contrib:0.142.0 \
+            validate --config=/etc/otel/config.yaml
+
+      - name: grafana dashboards are valid json with the panels we reference
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, pathlib, sys
+
+          failures = []
+          for path in sorted(pathlib.Path("deploy/grafana/dashboards").glob("*.json")):
+              data = json.loads(path.read_text())
+              for key in ("uid", "title", "panels"):
+                  if key not in data:
+                      failures.append(f"{path}: missing {key}")
+              if not data.get("panels"):
+                  failures.append(f"{path}: no panels")
+              print(f"ok {path} -> {data.get('title')} ({len(data.get('panels', []))} panels)")
+
+          uids = {
+              json.loads(p.read_text())["uid"]
+              for p in pathlib.Path("deploy/grafana/dashboards").glob("*.json")
+          }
+          # The README and the chaos script link to these by uid.
+          for want in ("otel-red", "otel-correlation"):
+              if want not in uids:
+                  failures.append(f"dashboard uid {want} is referenced but does not exist")
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  stack:
+    name: end-to-end through the real stack
+    runs-on: ubuntu-latest
+    needs: [go, node, config]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: bring the stack up
+        run: docker compose up -d --build --wait --wait-timeout 420
+
+      - name: show what is running
+        if: always()
+        run: docker compose ps
+
+      # This is the check that the in-memory span tests cannot make: that the
+      # spans leave the processes, survive the collector's tail sampler, and
+      # land in Tempo, Loki and Prometheus as one correlated whole.
+      - name: verify the telemetry actually arrives
+        run: ./scripts/verify-stack.sh
+
+      - name: generate some traffic through the chaos path
+        run: |
+          CHAOS_LATENCY_PCT=40 CHAOS_FAULT_PCT=15 \
+            docker compose up -d --no-deps --force-recreate gateway orders inventory
+          timeout 120 bash -c 'until curl -fsS -o /dev/null http://localhost:8080/healthz; do sleep 2; done'
+          ./scripts/traffic.sh 30
+
+      # With chaos on, the tail sampler must have kept error traces. An empty
+      # result here means either the sampler dropped them or the error path
+      # never set a span status -- both of which this project claims not to do.
+      - name: tempo holds error traces after a chaos run
+        run: |
+          set -eu
+          sleep 20
+          encoded='%7B%20status%20%3D%20error%20%7D'
+          for attempt in $(seq 1 20); do
+            body="$(curl -sS "http://localhost:3200/api/search?q=$encoded&limit=50" || true)"
+            count="$(printf '%s' "$body" | jq '[.traces[]?] | length' 2>/dev/null || echo 0)"
+            if [ "${count:-0}" -gt 0 ]; then
+              echo "TraceQL '{ status = error }' matched $count traces"
+              exit 0
+            fi
+            echo "attempt $attempt: no error traces yet"
+            sleep 6
+          done
+          echo "the tail sampler kept no error traces after a chaos run"
+          docker compose logs --tail 80 otel-collector tempo
+          exit 1
+
+      - name: dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: tear down
+        if: always()
+        run: docker compose down -v
