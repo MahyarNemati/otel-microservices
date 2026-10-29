@@ -181,3 +181,13 @@ func EventAttr(t *testing.T, event sdktrace.Event, key string) string {
 	t.Fatalf("event %q has no attribute %q; attributes: %v", event.Name, key, event.Attributes)
 	return ""
 }
+
+// UnsampledSpanContext returns a structurally valid but unsampled span context,
+// for testing the code paths that must treat a dropped trace as unlinkable.
+func UnsampledSpanContext() trace.SpanContext {
+	return trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     trace.SpanID{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: 0,
+	})
+}

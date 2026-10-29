@@ -3,7 +3,7 @@ package obs
 import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 // Resource attribute keys that the Grafana dashboards group by. They are named
@@ -38,6 +38,11 @@ func NewResource(cfg Config) (*resource.Resource, error) {
 
 	// resource.Default() contributes telemetry.sdk.* and the schema URL; merging
 	// onto it rather than replacing it keeps backend-side SDK dashboards working.
+	//
+	// The semconv version imported here must match the one resource.Default()
+	// was built against, or Merge fails with "conflicting Schema URL" and the
+	// service starts with no resource at all. Keep the import in step with the
+	// otel SDK version in go.mod.
 	return resource.Merge(resource.Default(), resource.NewWithAttributes(semconv.SchemaURL, attrs...))
 }
 
