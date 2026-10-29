@@ -66,7 +66,7 @@ Each row is asserted by tests that run without Docker — see
 ### Why this topology
 
 A trace is only interesting if it has something in it. One checkout produces
-**13 spans** across four processes and two runtimes:
+**12 spans** across four processes and two runtimes (CI asserts the count):
 
 | # | Span | Service | Kind | Note |
 |--:|---|---|---|---|
@@ -82,7 +82,7 @@ A trace is only interesting if it has something in it. One checkout produces
 | 10 | `fulfillment.pick_and_pack` | fulfillment | internal | |
 | 11 | `POST /commit` | fulfillment | client | injects, from Node |
 | 12 | `POST /commit` | inventory | server | remote parent = 11, back in Go |
-| 13 | *(queue gap)* | | | visible as the time between 8 and 9 |
+| — | *(the queue gap)* | | | not a span: the time between 8 and 9, which is why the producer/consumer kinds matter |
 
 Span 9 is the one that matters. It is the hop where a naive implementation
 loses the parent, and it crosses a runtime boundary at the same time, which is
@@ -440,7 +440,7 @@ cd services/fulfillment && npm test        # 30 tests
 ```
 
 ```bash
-./scripts/verify-stack.sh                  # 40+ assertions, needs the stack up
+./scripts/verify-stack.sh                  # 42 assertions, needs the stack up
 python3 scripts/validate-yaml.py           # strict: rejects duplicate keys
 shellcheck -S warning scripts/*.sh
 ```
@@ -650,7 +650,7 @@ deploy/
 scripts/
   traffic.sh        drive the stack, print trace ids
   chaos.sh          turn the dials and replay traffic
-  verify-stack.sh   40+ assertions against the running stack
+  verify-stack.sh   42 assertions against the running stack
   validate-yaml.py  strict YAML check that rejects duplicate keys
 ```
 
