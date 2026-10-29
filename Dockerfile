@@ -31,7 +31,7 @@ RUN go build -trimpath \
 
 # wget comes from busybox in the alpine runtime stage and is what the compose
 # healthchecks use; a distroless base would need a Go-based probe instead.
-FROM alpine:3.22 AS runtime
+FROM alpine:3.24 AS runtime
 RUN adduser -D -u 10001 app
 USER app
 
