@@ -1,0 +1,28 @@
+# Build output. Every binary name is anchored with a leading slash: a bare
+# `gateway` line would also match the cmd/gateway/ directory and ship a repo
+# with no entrypoint.
+/bin/
+/dist/
+/gateway
+/orders
+/inventory
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Node
+/services/fulfillment/node_modules/
+/services/fulfillment/dist/
+npm-debug.log*
+
+# Local stack state
+/deploy/data/
+/.env
+/scripts/.last-trace-id
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
