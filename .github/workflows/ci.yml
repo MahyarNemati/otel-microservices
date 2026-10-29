@@ -18,7 +18,7 @@ jobs:
     name: go build, vet and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -108,7 +108,7 @@ jobs:
       run:
         working-directory: services/fulfillment
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
@@ -160,7 +160,7 @@ jobs:
     name: stack configuration is valid
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: yaml parses, with duplicate keys rejected
         run: |
@@ -220,7 +220,7 @@ jobs:
     needs: [go, node, config]
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: bring the stack up
         run: docker compose up -d --build --wait --wait-timeout 420
