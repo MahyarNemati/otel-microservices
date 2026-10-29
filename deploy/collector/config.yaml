@@ -108,10 +108,20 @@ processors:
         value: "otel-collector"
         action: upsert
 
-  # Generate RED metrics from the spans themselves, so a service that exposes
-  # no Prometheus endpoint still has latency and error-rate series. Exemplars
-  # are on, which is what links these metrics back to a trace.
+# A connector, not a processor. spanmetrics consumes spans and produces metrics,
+# so it is an exporter in one pipeline and a receiver in another -- which is
+# exactly what a connector is for, and why declaring it under `processors:`
+# fails with "unknown type: spanmetrics".
+#
+# It generates RED metrics from the spans themselves, so a service that exposes
+# no Prometheus endpoint of its own -- the Node worker here -- still has latency
+# and error-rate series. Exemplars are on, which is what links those metrics
+# back to a trace.
+connectors:
   spanmetrics:
+    # Set explicitly rather than relying on the default, because the dashboards
+    # and the stack check both query traces_span_metrics_calls_total by name.
+    namespace: traces.span.metrics
     histogram:
       explicit:
         buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]

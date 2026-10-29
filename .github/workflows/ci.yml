@@ -130,7 +130,12 @@ jobs:
       - name: the propagation suites really ran
         run: |
           set -eu
-          passed="$(grep -cE '^\s+(✓|√)' /tmp/vitest.log || true)"
+          # Count the tick character itself, not an anchored pattern: on a CI
+          # runner vitest keeps its ANSI colour codes, so the escape sequence
+          # sits between the leading whitespace and the tick and an anchored
+          # match finds nothing -- reporting zero passing tests for a suite
+          # that passed all 30.
+          passed="$(grep -cF '✓' /tmp/vitest.log || true)"
           echo "$passed Vitest tests passed"
           if [ "$passed" -lt 25 ]; then
             echo "expected at least 25 passing Vitest tests, got $passed"
