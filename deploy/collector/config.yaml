@@ -1,0 +1,198 @@
+# OpenTelemetry Collector (contrib) configuration.
+#
+# The collector is where the interesting decisions live, because it is the only
+# component that sees a whole trace before anything is stored.
+#
+# ---------------------------------------------------------------------------
+# Why tail sampling, and not head sampling
+# ---------------------------------------------------------------------------
+# Head sampling means each service decides, at the moment it starts a span,
+# whether to keep the trace -- before anything has happened. At 10% head
+# sampling you keep 10% of your errors and 10% of your slow requests, which are
+# the only traces anyone ever looks for. You also pay for the errors you did
+# keep without being able to say "show me all of them", because nobody can tell
+# whether an error is rare or simply unsampled.
+#
+# Tail sampling moves the decision to the collector, which buffers spans by
+# trace id for `decision_wait` and then judges the completed trace. That buys
+# the thing head sampling cannot: keep 100% of errors and slow traces, and
+# sample the boring ones hard.
+#
+# The costs are real and worth stating:
+#   * The collector must see every span of a trace, so with more than one
+#     collector replica you need a trace-id-aware load balancer in front
+#     (the loadbalancing exporter) or decisions are made on partial traces.
+#   * `decision_wait` is added latency before a trace is queryable, and a trace
+#     longer than that window is judged on what arrived in time.
+#   * Buffering costs memory, bounded here by `num_traces`.
+#
+# The services therefore sample everything at the head
+# (OTEL_TRACES_SAMPLER_ARG=1.0) and leave the decision to the policies below.
+# ---------------------------------------------------------------------------
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # memory_limiter must be the first processor in every pipeline: it sheds load
+  # by refusing new data, and a processor ahead of it would already have done
+  # the allocation it is trying to prevent.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  tail_sampling:
+    # How long to wait for a trace to finish before judging it. The slowest
+    # path in this topology is gateway -> orders -> inventory -> queue ->
+    # worker -> inventory, which with chaos latency on can take a couple of
+    # seconds; 5s leaves headroom.
+    decision_wait: 5s
+    num_traces: 50000
+    expected_new_traces_per_sec: 200
+    policies:
+      # 1. Every trace containing an error span. This is the whole point.
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+
+      # 2. Every slow trace, whatever its status. A 2-second success is as
+      #    interesting as a failure and head sampling would have thrown it away.
+      - name: slow
+        type: latency
+        latency:
+          threshold_ms: 500
+
+      # 3. Every trace the chaos script marked, so a demo run is always fully
+      #    visible even if it happened to be fast and successful.
+      - name: chaos-marked
+        type: string_attribute
+        string_attribute:
+          key: chaos.injected_fault
+          values: ["true"]
+          enabled_regex_matching: false
+
+      # 4. Anything a client explicitly asked to keep, via baggage or an
+      #    attribute. Useful for "run this one request and watch it".
+      - name: explicitly-requested
+        type: boolean_attribute
+        boolean_attribute:
+          key: sampling.priority.high
+          value: true
+
+      # 5. Everything else: 20% of ordinary, fast, successful traffic. This is
+      #    the only policy that throws anything away.
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 20
+
+  # Copy resource attributes that Loki should turn into labels. Loki's OTLP
+  # endpoint promotes a fixed set of resource attributes to labels and pushes
+  # the rest into structured metadata; naming them here makes the mapping
+  # explicit rather than depending on Loki's defaults.
+  resource:
+    attributes:
+      - key: collector.received_at
+        value: "otel-collector"
+        action: upsert
+
+  # Generate RED metrics from the spans themselves, so a service that exposes
+  # no Prometheus endpoint still has latency and error-rate series. Exemplars
+  # are on, which is what links these metrics back to a trace.
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+    dimensions:
+      - name: http.route
+      - name: service.version
+      - name: deployment.environment.name
+    exemplars:
+      enabled: true
+    metrics_flush_interval: 15s
+
+exporters:
+  # Traces to Tempo over OTLP/gRPC.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Logs to Loki's native OTLP endpoint. The dedicated `loki` exporter was
+  # deprecated and removed; Loki 3.x ingests OTLP directly at /otlp, which also
+  # preserves trace_id and span_id as structured metadata instead of flattening
+  # them into the line.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+  # Metrics are scraped from the collector by Prometheus rather than pushed, so
+  # the collector's own uptime is visible as a scrape failure.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Without this, resource attributes are dropped and spanmetrics series
+    # cannot be grouped by service.version.
+    resource_to_telemetry_conversion:
+      enabled: true
+    enable_open_metrics: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  pipelines:
+    # spanmetrics must be fed from the *unsampled* span stream, before
+    # tail_sampling. Deriving RED metrics from sampled spans gives a request
+    # rate that is 20% of reality and an error rate skewed by the very policy
+    # that keeps all the errors -- a classic way to produce a dashboard that
+    # says 100% of requests are failing.
+    traces/metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [spanmetrics]
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, resource, batch]
+      exporters: [otlp/tempo]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]
+
+    metrics:
+      receivers: [otlp, spanmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

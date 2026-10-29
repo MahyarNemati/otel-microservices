@@ -1,0 +1,183 @@
+{
+  "uid": "otel-correlation",
+  "title": "Trace and log correlation",
+  "tags": [
+    "otel-microservices"
+  ],
+  "timezone": "browser",
+  "refresh": "",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "trace_id",
+        "label": "Trace ID",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "description": "Paste the X-Trace-Id header or the trace_id from a response body."
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "loki"
+        },
+        "query": "label_values(service_name)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "The point of this dashboard",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Paste a trace id into the **Trace ID** box at the top. Both panels below fill in:\n\n* **The trace** -- every span, across the Go gateway, the Go order and inventory services, the Redis queue, and the Node worker. Click any span and choose *Logs for this span*.\n* **Its log lines** -- from every service that touched the request, in one stream, filtered by `trace_id` in Loki's structured metadata.\n\nA trace id is on the `X-Trace-Id` response header and in the `trace_id` field of every JSON response body, including error bodies. `./scripts/chaos.sh` prints the ones it generated.\n\nThis works because every log line carries `trace_id` and `span_id` (`internal/obs/slog.go` for Go, `src/logger.ts` for Node) and because Loki keeps them as structured metadata rather than labels -- a trace id as a label would mean one Loki stream per trace."
+      }
+    },
+    {
+      "type": "traces",
+      "title": "Trace $trace_id",
+      "gridPos": {
+        "h": 15,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "$trace_id",
+          "refId": "A"
+        }
+      ],
+      "description": "Expect gateway POST /checkout -> orders POST /orders -> inventory POST /reserve, plus orders.insert, an orders.fulfil publish span, and -- after the queue gap -- an orders.fulfil process span from the Node worker with its own POST /commit back into Go."
+    },
+    {
+      "type": "logs",
+      "title": "Every log line in trace $trace_id",
+      "gridPos": {
+        "h": 13,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{service_name=~\"$service\"} | trace_id=`$trace_id`",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Ascending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "prettifyLogMessage": true
+      },
+      "description": "The filter is on structured metadata, which is how the trace id survives without becoming a label."
+    },
+    {
+      "type": "logs",
+      "title": "Recent errors across all services (click TraceID to jump)",
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{service_name=~\"$service\"} |= `` | json | level=~\"error|warn\"",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none"
+      },
+      "description": "The reverse direction: start from a log line and open its trace. The TraceID link comes from the derivedFields in deploy/grafana/provisioning/datasources/datasources.yaml."
+    },
+    {
+      "type": "nodeGraph",
+      "title": "Service graph",
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "serviceMap",
+          "refId": "A"
+        }
+      ],
+      "description": "Built by Tempo's service-graphs metrics generator from the parent/child edges in the traces. The queue edge only appears here if the trace context survived the async hop -- an orphaned worker span shows up as a disconnected node, which makes this panel a propagation smoke test."
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

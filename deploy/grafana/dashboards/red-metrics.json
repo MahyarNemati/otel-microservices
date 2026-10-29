@@ -1,0 +1,515 @@
+{
+  "uid": "otel-red",
+  "title": "RED metrics and exemplars",
+  "tags": [
+    "otel-microservices"
+  ],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "environment",
+        "label": "Environment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(http_requests_total, deployment_environment_name)",
+        "refresh": 1,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(http_requests_total{deployment_environment_name=~\"$environment\"}, service_name)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "How to read this",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Every panel here groups by `service_name`, `service_version` and `deployment_environment_name`, which are the Prometheus spellings of the resource attributes set in `internal/obs/resource.go` and `src/telemetry.ts`.\n\n**The latency panel carries exemplars.** Enable them with the small dot icon on the panel legend, then click a diamond to open an example trace of a request in that bucket. That is the path from \"p99 is bad\" to \"here is why\" -- it needs `ObserveWithExemplar`, an OpenMetrics `/metrics` endpoint, and Prometheus started with `--enable-feature=exemplar-storage`. All three are wired; see `internal/metrics/metrics.go`.\n\nThe *fulfillment* worker has no `/metrics` endpoint of its own. Its series come from the collector's `spanmetrics` connector, fed from the **unsampled** span stream so the rates are real rather than 20% of real."
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate by service (requests/s)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service_name) (rate(http_requests_total{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[2m]))",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A",
+          "exemplar": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate by service (fraction of requests)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service_name) (rate(http_requests_total{service_name=~\"$service\",deployment_environment_name=~\"$environment\",status=~\"5..\"}[2m])) / clamp_min(sum by (service_name) (rate(http_requests_total{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[2m])), 0.001)",
+          "legendFormat": "{{service_name}} 5xx",
+          "range": true,
+          "refId": "A",
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service_name) (rate(http_requests_total{service_name=~\"$service\",deployment_environment_name=~\"$environment\",status=~\"4..\"}[2m])) / clamp_min(sum by (service_name) (rate(http_requests_total{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[2m])), 0.001)",
+          "legendFormat": "{{service_name}} 4xx",
+          "range": true,
+          "refId": "B",
+          "exemplar": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "4xx and 5xx are plotted separately on purpose: a caller sending bad input is not a failure of this service, which is why spanerr leaves the span status Unset for a client fault."
+    },
+    {
+      "type": "timeseries",
+      "title": "Request latency, p50 / p95 / p99 -- CLICK AN EXEMPLAR",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, service_name) (rate(http_request_duration_seconds_bucket{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[2m])))",
+          "legendFormat": "p50 {{service_name}}",
+          "range": true,
+          "refId": "A",
+          "exemplar": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, service_name) (rate(http_request_duration_seconds_bucket{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[2m])))",
+          "legendFormat": "p95 {{service_name}}",
+          "range": true,
+          "refId": "B",
+          "exemplar": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, service_name) (rate(http_request_duration_seconds_bucket{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[2m])))",
+          "legendFormat": "p99 {{service_name}}",
+          "range": true,
+          "refId": "C",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Exemplars are attached to this histogram. Each diamond is one real request; clicking it opens that request's trace in Tempo."
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency by route (p95)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, route, service_name) (rate(http_request_duration_seconds_bucket{service_name=~\"$service\",deployment_environment_name=~\"$environment\"}[5m])))",
+          "legendFormat": "{{service_name}} {{route}}",
+          "range": true,
+          "refId": "A",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Grouped by the route *template*, never the raw path -- see the routeTag middleware in internal/httpx."
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth and queue wait",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (topic) (queue_depth{deployment_environment_name=~\"$environment\"})",
+          "legendFormat": "depth {{topic}}",
+          "range": true,
+          "refId": "A",
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(queue_wait_seconds_bucket{deployment_environment_name=~\"$environment\"}[5m])))",
+          "legendFormat": "p95 wait {{topic}} (s)",
+          "range": true,
+          "refId": "B",
+          "exemplar": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Depth is published by the order service, not the worker: a worker keeping up reports zero, which is exactly when the producer's view matters."
+    },
+    {
+      "type": "timeseries",
+      "title": "Span rate from the collector (all services, unsampled)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service_name) (rate(traces_span_metrics_calls_total[2m]))",
+          "legendFormat": "{{service_name}}",
+          "range": true,
+          "refId": "A",
+          "exemplar": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "These come from the spanmetrics connector, which sits on the pre-sampling pipeline. The Node worker appears here and nowhere else."
+    },
+    {
+      "type": "timeseries",
+      "title": "Spans the collector dropped",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_processor_dropped_spans_total[5m]))",
+          "legendFormat": "dropped",
+          "range": true,
+          "refId": "A",
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans_total[5m]))",
+          "legendFormat": "export failed",
+          "range": true,
+          "refId": "B",
+          "exemplar": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early_total[5m]))",
+          "legendFormat": "tail sampler: trace arrived too late",
+          "range": true,
+          "refId": "C",
+          "exemplar": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "A missing trace is either a propagation bug or data loss. This panel tells the two apart; the third series is the tail sampler's decision_wait being too short."
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

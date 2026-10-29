@@ -1,0 +1,49 @@
+# Prometheus scrape configuration.
+#
+# Note the `--enable-feature=exemplar-storage` flag in docker-compose.yml: it is
+# the reason the exemplars this stack emits are kept rather than parsed and
+# discarded. Without it everything below still works and the metric-to-trace
+# link silently does not.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: otel-microservices
+    environment: local
+
+scrape_configs:
+  # The Go services expose their own /metrics with trace_id exemplars on
+  # http_request_duration_seconds.
+  - job_name: services
+    honor_labels: true
+    static_configs:
+      - targets:
+          - gateway:8080
+          - orders:8081
+          - inventory:8082
+        labels:
+          source: service
+
+  # The collector's spanmetrics connector output: RED metrics derived from the
+  # spans themselves, for every service including the Node worker, which
+  # exposes no Prometheus endpoint of its own.
+  - job_name: otel-collector-spanmetrics
+    honor_labels: true
+    static_configs:
+      - targets: ['otel-collector:8889']
+        labels:
+          source: spanmetrics
+
+  # The collector's own internal telemetry, so a dropped-span problem is
+  # visible as otelcol_processor_dropped_spans rather than as a mystery.
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ['otel-collector:8888']
+
+  - job_name: tempo
+    static_configs:
+      - targets: ['tempo:3200']
+
+  - job_name: loki
+    static_configs:
+      - targets: ['loki:3100']

@@ -1,0 +1,11 @@
+.git
+.github
+/deploy/data
+/services/fulfillment/node_modules
+/services/fulfillment/dist
+/bin
+/dist
+*.out
+coverage.*
+.DS_Store
+README.md

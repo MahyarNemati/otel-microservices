@@ -1,0 +1,247 @@
+# The whole stack: four services, a queue, and the observability backends.
+#
+#   docker compose up --build
+#   ./scripts/traffic.sh        # generate some traces
+#   open http://localhost:3000  # Grafana, anonymous admin
+#
+# Data flow:
+#
+#   gateway ─http─> orders ─http─> inventory
+#                      │
+#                      └─redis list─> fulfillment (Node) ─http─> inventory
+#
+#   all four ─OTLP/HTTP─> otel-collector ─> tempo   (traces, after tail sampling)
+#                                        ─> loki    (logs, via Loki's OTLP endpoint)
+#                                        ─> prometheus scrape :8889 (spanmetrics)
+#   gateway/orders/inventory ─ /metrics scraped directly by prometheus (exemplars)
+
+name: otel-microservices
+
+x-telemetry: &telemetry
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  DEPLOYMENT_ENVIRONMENT: local
+  SERVICE_VERSION: ${SERVICE_VERSION:-0.1.0}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  LOG_FORMAT: json
+  # Head sampling stays at 1.0 on purpose. The collector's tail sampler makes
+  # the keep/drop decision once it has seen the whole trace; see
+  # deploy/collector/config.yaml for the reasoning.
+  OTEL_TRACES_SAMPLER_ARG: "1.0"
+
+# The Go services take the telemetry settings plus the chaos dials. This is a
+# single mapping rather than `<<: [*telemetry, *chaos]`: the sequence form of a
+# merge key is valid YAML but less widely supported, and a compose file that
+# fails to parse is a bad place to find that out.
+x-app-env: &app-env
+  <<: *telemetry
+  CHAOS_LATENCY_PCT: ${CHAOS_LATENCY_PCT:-0}
+  CHAOS_LATENCY_MIN_MS: ${CHAOS_LATENCY_MIN_MS:-50}
+  CHAOS_LATENCY_MAX_MS: ${CHAOS_LATENCY_MAX_MS:-800}
+  CHAOS_FAULT_PCT: ${CHAOS_FAULT_PCT:-0}
+
+services:
+  # ---------------------------------------------------------------- application
+  gateway:
+    build:
+      context: .
+      target: gateway
+      args:
+        SERVICE_VERSION: ${SERVICE_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: gateway
+      LISTEN_ADDR: ":8080"
+      ORDERS_URL: http://orders:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      orders:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  orders:
+    build:
+      context: .
+      target: orders
+      args:
+        SERVICE_VERSION: ${SERVICE_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: orders
+      LISTEN_ADDR: ":8081"
+      INVENTORY_URL: http://inventory:8082
+      REDIS_ADDR: redis:6379
+      QUEUE_PREFIX: otelq
+    ports:
+      - "8081:8081"
+    depends_on:
+      inventory:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  inventory:
+    build:
+      context: .
+      target: inventory
+      args:
+        SERVICE_VERSION: ${SERVICE_VERSION:-0.1.0}
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: inventory
+      LISTEN_ADDR: ":8082"
+    ports:
+      - "8082:8082"
+    depends_on:
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  fulfillment:
+    build:
+      context: ./services/fulfillment
+    environment:
+      <<: *telemetry
+      OTEL_SERVICE_NAME: fulfillment
+      REDIS_URL: redis://redis:6379
+      QUEUE_TOPIC: orders.fulfil
+      QUEUE_PREFIX: otelq
+      INVENTORY_URL: http://inventory:8082
+      HEALTH_PORT: "8083"
+    ports:
+      - "8083:8083"
+    depends_on:
+      redis:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8083/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ---------------------------------------------------------------------- queue
+  redis:
+    image: redis:8.2-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ------------------------------------------------------------- observability
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.142.0
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./deploy/collector/config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter (spanmetrics)
+      - "13133:13133" # health_check
+      - "55679:55679" # zpages
+    depends_on:
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    # No healthcheck: the collector image ships no shell, wget or curl, so any
+    # `test:` would report unhealthy forever and every depends_on waiting on it
+    # would block. The services do not need it to be up either -- the OTLP
+    # exporters retry with backoff -- so they depend on it having started.
+
+  tempo:
+    image: grafana/tempo:2.9.0
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    user: root
+    volumes:
+      - ./deploy/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    # No healthcheck: the image carries no shell probe we can rely on, and an
+    # unrunnable healthcheck reports unhealthy forever. Readiness is polled
+    # explicitly by scripts/verify-stack.sh against /ready instead.
+
+  loki:
+    image: grafana/loki:3.6.0
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    user: root
+    volumes:
+      - ./deploy/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=6h
+      # Without this flag Prometheus parses the exemplars and throws them away,
+      # and the metric-to-trace link silently does nothing.
+      - --enable-feature=exemplar-storage
+      # Tempo's metrics generator remote-writes service graphs here.
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor,traceToMetrics
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+
+volumes:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

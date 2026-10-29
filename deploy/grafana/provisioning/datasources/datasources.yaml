@@ -1,0 +1,109 @@
+# Grafana datasources, provisioned so the links work on first boot.
+#
+# The three link definitions below are the reason this file is long. They are
+# what turns three separate products into one navigable thing:
+#
+#   Tempo  -> Loki     tracesToLogsV2: from a span, show its log lines
+#   Loki   -> Tempo    derivedFields:  from a log line, open its trace
+#   Prom   -> Tempo    exemplars:      from a latency point, open an example
+#
+# Each one needs the producing side to have done its part, which is why they
+# are listed next to the code that does it:
+#   * trace_id on every log line            -> internal/obs/slog.go, src/logger.ts
+#   * trace_id exemplars on the histogram   -> internal/metrics/metrics.go
+#   * matching resource attributes          -> internal/obs/resource.go, src/telemetry.ts
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    jsonData:
+      # Span -> logs. Loki stores trace_id as structured metadata (see
+      # deploy/loki/loki.yaml), so the filter is on the metadata, not the line.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        filterByTraceID: false
+        filterBySpanID: false
+        # Tag mapping: the span's resource attribute service.name becomes the
+        # Loki label service_name. Loki labels cannot contain dots, which is
+        # why this mapping has to be stated rather than inferred.
+        tags:
+          - key: service.name
+            value: service_name
+        customQuery: true
+        query: '{service_name="$${__span.tags["service.name"]}"} | trace_id="$${__span.traceId}"'
+
+      # Span -> metrics. Uses the collector's spanmetrics output.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        tags:
+          - key: service.name
+            value: service_name
+        queries:
+          - name: 'Request rate for this service'
+            query: 'sum(rate(traces_span_metrics_calls_total{$$__tags}[5m]))'
+          - name: 'Error rate for this service'
+            query: 'sum(rate(traces_span_metrics_calls_total{$$__tags,status_code="STATUS_CODE_ERROR"}[5m]))'
+
+      # The node graph, from Tempo's service-graphs metrics generator.
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      tracesToProfiles:
+        datasourceUid: ''
+      search:
+        hide: false
+      lokiSearch:
+        datasourceUid: loki
+      streamingEnabled:
+        search: true
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Log -> trace. The regex reads the trace id out of the JSON line, which
+      # is the stdout format the services write; the structured-metadata copy
+      # is used by the Tempo -> Loki direction above. Supporting both means the
+      # link works whether a line arrived via OTLP or via a log scraper.
+      derivedFields:
+        - name: TraceID
+          matcherType: regex
+          matcherRegex: '"trace_id":"([a-f0-9]{32})"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+          urlDisplayLabel: 'View trace'
+        - name: TraceIDMetadata
+          matcherType: label
+          matcherRegex: trace_id
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+          urlDisplayLabel: 'View trace'
+      maxLines: 2000
+
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s
+      # Metric -> trace. This is the setting that makes an exemplar clickable;
+      # Prometheus must also be run with --enable-feature=exemplar-storage, or
+      # there is nothing here to click.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo

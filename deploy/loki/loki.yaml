@@ -1,0 +1,65 @@
+# Loki 3.x, single-binary, filesystem backend.
+#
+# The settings that matter for this project are under limits_config:
+# OTLP ingestion is what the collector uses, and structured metadata is what
+# carries trace_id and span_id without turning them into labels. A trace id as
+# a *label* would be catastrophic -- one stream per trace -- which is why Loki
+# refuses to do it and why the link in the Grafana datasource config filters on
+# structured metadata instead.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Required for trace_id/span_id to survive as structured metadata.
+  allow_structured_metadata: true
+  volume_enabled: true
+  # The demo replays traffic, and a chaos run can backdate nothing but a
+  # restart can; a generous window avoids silently dropping lines.
+  reject_old_samples: false
+  retention_period: 24h
+  otlp_config:
+    resource_attributes:
+      # Promote exactly the resource attributes the dashboards group by to
+      # labels, and let everything else fall through to structured metadata.
+      # Promoting more would multiply streams for no benefit.
+      attributes_config:
+        - action: index_label
+          attributes:
+            - service.name
+            - service.version
+            - deployment.environment.name
+
+pattern_ingester:
+  enabled: true
+
+ruler:
+  alertmanager_url: http://localhost:9093
+
+analytics:
+  reporting_enabled: false
