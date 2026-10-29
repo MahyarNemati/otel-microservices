@@ -1,7 +1,8 @@
 {
+  "// note": "This config covers EVERY file under src, test files included, and is what `npm run typecheck` and editors use. A tsconfig that excludes the tests means a type error in a test only ever surfaces at runtime, because vitest transpiles without checking. Emit is configured separately in tsconfig.build.json.",
   "compilerOptions": {
     "target": "ES2023",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "DOM"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "outDir": "dist",
@@ -9,6 +10,8 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "exactOptionalPropertyTypes": true,
     "declaration": true,
     "sourceMap": true,
@@ -16,9 +19,7 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "verbatimModuleSyntax": true,
-    "composite": true,
-    "tsBuildInfoFile": "dist/.tsbuildinfo"
+    "types": ["node"]
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  "include": ["src/**/*.ts"]
 }

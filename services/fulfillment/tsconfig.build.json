@@ -1,0 +1,9 @@
+{
+  "// note": "Emit config. Excludes the tests and the in-memory span recorder they use, so the runtime image does not ship a test harness.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/testing.ts"]
+}

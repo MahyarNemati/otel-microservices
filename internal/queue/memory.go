@@ -13,7 +13,6 @@ type Memory struct {
 	mu     sync.Mutex
 	queues map[string][]Message
 	signal chan struct{}
-	closed bool
 }
 
 // NewMemory builds an empty in-memory backend.
@@ -77,13 +76,8 @@ func (m *Memory) Depth(_ context.Context, topic string) (int64, error) {
 	return int64(len(m.queues[topic])), nil
 }
 
-// Close implements [Backend].
-func (m *Memory) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	return nil
-}
+// Close implements [Backend]. There is nothing to release.
+func (m *Memory) Close() error { return nil }
 
 // Len reports the queue depth without a context. Test helper.
 func (m *Memory) Len(topic string) int {

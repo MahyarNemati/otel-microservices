@@ -69,9 +69,6 @@ func (h *TraceHandler) WithGroup(name string) slog.Handler {
 	return &TraceHandler{inner: h.inner.WithGroup(name)}
 }
 
-// Inner returns the wrapped handler. Used by tests.
-func (h *TraceHandler) Inner() slog.Handler { return h.inner }
-
 // fanout sends each record to every handler, so one slog call reaches both the
 // container's stdout (for `docker compose logs`) and the OTLP log pipeline
 // (for Loki) without the call site knowing there are two destinations.
