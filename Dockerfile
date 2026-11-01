@@ -5,7 +5,7 @@
 # CGO_ENABLED=0 here is about producing a static binary for a distroless base,
 # not about the broken local macOS SDK. CI must not set it globally, because
 # `go test -race` needs cgo.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 
 WORKDIR /src
 
